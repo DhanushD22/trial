@@ -1,61 +1,21 @@
+# processor/video_processor.py
+
 import cv2
 import os
 import json
 import time
-import torch
-from detectron2.engine import DefaultPredictor
-from detectron2.config import get_cfg
-from detectron2.model_zoo import model_zoo
 from detectron2.utils.visualizer import Visualizer, ColorMode
 from detectron2.data import MetadataCatalog
 
-# ================================
-# CONFIGURATION
-# ================================
-VIDEO_NAME = "vid3.mp4"
-INPUT_VIDEO_DIR = "../inputs"
-OUTPUT_BASE_DIR = "../../outputs/detections"
-REPORT_DIR = "../../outputs/reports"
-LOG_DIR = "../logs"
-VIDEO_TAG = "vid3"
 
-OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, VIDEO_TAG)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(REPORT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-REPORT_FILE = os.path.join(REPORT_DIR, f"train_report_{VIDEO_TAG}.json")
-SIM_LOG_FILE = os.path.join(LOG_DIR, f"simulation_{VIDEO_TAG}.log")
-
-WAGON_INTERVAL_SEC = 4.0
-IOU_THRESHOLD = 0.3   # lower threshold for stability
-DEFECT_CLASSES = {"crack", "chip", "missing_spring"}
-
-# ================================
-# MODEL SETUP (GPU ENABLED)
-# ================================
-cfg = get_cfg()
-cfg.merge_from_file(
-    model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+from config.settings import (
+    DETECTION_DIR,
+    REPORT_DIR,
+    WAGON_INTERVAL_SEC,
+    IOU_THRESHOLD,
+    DEFECT_CLASSES,
 )
-cfg.MODEL.ROI_HEADS.NUM_CLASSES = 5
-cfg.MODEL.WEIGHTS = "../../models/checkpoints/model_final.pth"
-cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.50
 
-if torch.cuda.is_available():
-    print("✅ Using GPU:", torch.cuda.get_device_name(0))
-    cfg.MODEL.DEVICE = "cuda"
-    torch.backends.cudnn.benchmark = True
-else:
-    print("⚠ GPU not available, using CPU")
-    cfg.MODEL.DEVICE = "cpu"
-
-predictor = DefaultPredictor(cfg)
-
-MetadataCatalog.get("rail_defects_train").thing_classes = [
-    "crack", "chip", "missing_spring", "spring", "normal"
-]
-metadata = MetadataCatalog.get("rail_defects_train")
 
 # ================================
 # IOU FUNCTION
@@ -65,41 +25,57 @@ def iou(box1, box2):
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
+
     inter = max(0, x2 - x1) * max(0, y2 - y1)
 
     area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
     area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
 
     union = area1 + area2 - inter
+
     return inter / union if union > 0 else 0
 
+
 # ================================
-# VIDEO PROCESSING
+# MAIN PROCESSING FUNCTION
 # ================================
-video_path = os.path.join(INPUT_VIDEO_DIR, VIDEO_NAME)
-cap = cv2.VideoCapture(video_path)
+def process_video(video_path, session_id, predictor):
 
-if not cap.isOpened():
-    print(f"Error: Could not open video {video_path}")
-    exit()
+    print(f"\n📹 Processing video: {video_path}")
+    print(f"🆔 Session ID: {session_id}")
 
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Create output folders
+    session_detection_dir = os.path.join(DETECTION_DIR, session_id)
+    os.makedirs(session_detection_dir, exist_ok=True)
+    os.makedirs(REPORT_DIR, exist_ok=True)
 
-print(f"\nVideo: {VIDEO_NAME}")
-print(f"FPS: {fps:.2f}")
-print(f"Total Frames: {total_frames}")
-print(f"Duration: {total_frames/fps:.2f} seconds")
-print("Starting analysis...\n")
+    report_file = os.path.join(REPORT_DIR, f"{session_id}.json")
 
-train_report = {"train": {}}
+    # Setup metadata (same as simulate.py)
+    MetadataCatalog.get("rail_defects_train").thing_classes = [
+        "crack",
+        "chip",
+        "missing_spring",
+        "spring",
+        "normal",
+    ]
+    metadata = MetadataCatalog.get("rail_defects_train")
 
-with open(SIM_LOG_FILE, "a") as log_f:
+    # Open video
+    cap = cv2.VideoCapture(video_path)
 
-    def log_print(msg):
-        print(msg)
-        log_f.write(msg + "\n")
-        log_f.flush()
+    if not cap.isOpened():
+        print("❌ Could not open video")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    print(f"FPS: {fps}")
+    print(f"Total Frames: {total_frames}")
+    print("🔍 Starting analysis...\n")
+
+    train_report = {"train": {}}
 
     frame_count = 0
     current_wagon = 1
@@ -123,7 +99,7 @@ with open(SIM_LOG_FILE, "a") as log_f:
             current_wagon_defects = []
             current_wagon_logged_defects = []
 
-            log_print(f"\n🚃 New wagon: wagon{current_wagon}")
+            print(f"\n🚃 New wagon: wagon{current_wagon}")
 
         # Inference
         outputs = predictor(frame)
@@ -143,6 +119,7 @@ with open(SIM_LOG_FILE, "a") as log_f:
 
         for i in range(len(classes)):
             class_name = metadata.thing_classes[classes[i]]
+
             if class_name in DEFECT_CLASSES:
                 detected_defects_this_frame.append({
                     "timestamp_sec": timestamp_sec,
@@ -157,15 +134,16 @@ with open(SIM_LOG_FILE, "a") as log_f:
         if not detected_defects_this_frame:
             continue
 
-        # Duplicate suppression (position-based)
+        # Duplicate suppression
         to_log = []
 
         for defect in detected_defects_this_frame:
             is_duplicate = False
+
             for logged in current_wagon_logged_defects:
                 if (
-                    defect["class"] == logged["class"] and
-                    iou(defect["bbox"], logged["bbox"]) >= IOU_THRESHOLD
+                    defect["class"] == logged["class"]
+                    and iou(defect["bbox"], logged["bbox"]) >= IOU_THRESHOLD
                 ):
                     is_duplicate = True
                     break
@@ -173,7 +151,7 @@ with open(SIM_LOG_FILE, "a") as log_f:
             if not is_duplicate:
                 to_log.append(defect)
 
-        # Update memory AFTER filtering
+        # Update memory
         for new_defect in to_log:
             current_wagon_logged_defects.append({
                 "class": new_defect["class"],
@@ -183,7 +161,7 @@ with open(SIM_LOG_FILE, "a") as log_f:
         if not to_log:
             continue
 
-        # Visualize and save only when new defect appears
+        # Visualize only when new defect appears
         v = Visualizer(
             frame[:, :, ::-1],
             metadata=metadata,
@@ -194,16 +172,18 @@ with open(SIM_LOG_FILE, "a") as log_f:
         annotated_frame = v.get_image()[:, :, ::-1]
 
         image_name = f"frame_{frame_count:06d}_wagon{current_wagon}.jpg"
-        image_path = os.path.join(OUTPUT_DIR, image_name)
+        image_path = os.path.join(session_detection_dir, image_name)
+
         cv2.imwrite(image_path, annotated_frame)
 
-        rel_path = f"detections/{VIDEO_TAG}/{image_name}"
+        # Relative path for JSON
+        rel_path = f"detections/{session_id}/{image_name}"
 
         for defect in to_log:
             defect["image_path"] = rel_path
             current_wagon_defects.append(defect)
 
-        log_print(
+        print(
             f"Frame {frame_count} | wagon{current_wagon} | "
             f"New defects logged: {len(to_log)}"
         )
@@ -212,20 +192,17 @@ with open(SIM_LOG_FILE, "a") as log_f:
     if current_wagon_defects:
         train_report["train"][f"wagon{current_wagon}"] = current_wagon_defects
 
-cap.release()
+    cap.release()
 
-# ================================
-# SAVE REPORT
-# ================================
-with open(REPORT_FILE, "w") as f:
-    json.dump(train_report, f, indent=4)
+    # Save report
+    with open(report_file, "w") as f:
+        json.dump(train_report, f, indent=4)
 
-total_defects = sum(len(v) for v in train_report["train"].values())
+    total_defects = sum(len(v) for v in train_report["train"].values())
 
-print("\n" + "="*60)
-print("Simulation & Analysis Complete")
-print(f"Total wagons simulated: {current_wagon}")
-print(f"Total unique defects logged: {total_defects}")
-print(f"Report saved at: {REPORT_FILE}")
-print(f"Log saved at: {SIM_LOG_FILE}")
-print("="*60)
+    print("\n" + "=" * 60)
+    print("✅ Analysis Complete")
+    print(f"Total wagons: {current_wagon}")
+    print(f"Total unique defects: {total_defects}")
+    print(f"Report saved at: {report_file}")
+    print("=" * 60)
